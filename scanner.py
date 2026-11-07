@@ -20,10 +20,23 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 
+from cache import DiskCache
 
 st = None
 
 DEFAULT_CSV = "xtb_stocks_etfs.csv"
+CACHE_DIR = ".cache"
+
+# Cache disque (voir cache.py). Désactivé par défaut : le CLI l'active via configure_cache().
+CACHE: DiskCache | None = None
+
+
+def configure_cache(root, **options) -> DiskCache | None:
+    """Active le cache disque dans `root` (None pour le désactiver)."""
+    global CACHE
+    CACHE = DiskCache(root, **options) if root else None
+    return CACHE
+
 
 # Téléchargement : peu de requêtes en parallèle (trop de threads => timeouts DNS / limites Yahoo
 # et des titres existants sont alors pris à tort pour « delisted »), puis seconde chance.
@@ -268,6 +281,17 @@ fetch_chunk = _cache(_download_close)
 
 def fetch_prices(tickers, start, end, progress_cb=None, chunk=100,
                  retry_rounds=RETRY_ROUNDS) -> pd.DataFrame:
+    """Cours de clôture ajustés. Passe par le cache disque s'il est activé."""
+    if CACHE is None:
+        return _fetch_network(tickers, start, end, progress_cb, chunk, retry_rounds)
+
+    def network(part, g_start, g_end, cb):
+        return _fetch_network(part, g_start, g_end, cb, chunk, retry_rounds)
+    return CACHE.fetch_prices(list(tickers), start, end, network, progress_cb)
+
+
+def _fetch_network(tickers, start, end, progress_cb=None, chunk=100,
+                   retry_rounds=RETRY_ROUNDS) -> pd.DataFrame:
     frames = []
     for i in range(0, len(tickers), chunk):
         part = tuple(tickers[i:i + chunk])
@@ -313,6 +337,7 @@ def fetch_prices(tickers, start, end, progress_cb=None, chunk=100,
 # PER (Price/Earnings)
 # --------------------------------------------------------------------------- #
 _PE_CACHE: dict[str, tuple[float, float]] = {}
+_PE_NEW: dict[str, tuple[float, float]] = {}  # reçus du réseau, à écrire sur disque
 
 
 def _to_float(x) -> float:
@@ -327,12 +352,19 @@ def get_pe(yahoo_ticker: str) -> tuple[float, float]:
     """(PER sur 12 derniers mois, PER prévu). NaN si Yahoo n'a pas la donnée
     (bénéfices négatifs, ETF, titre mal couvert...)."""
     if yahoo_ticker not in _PE_CACHE:
-        try:
-            info = yf.Ticker(yahoo_ticker).info
-            _PE_CACHE[yahoo_ticker] = (_to_float(info.get("trailingPE")),
-                                       _to_float(info.get("forwardPE")))
-        except Exception:
-            _PE_CACHE[yahoo_ticker] = (np.nan, np.nan)
+        hit = CACHE.get_pe(yahoo_ticker) if CACHE else None
+        if hit is not None:
+            _PE_CACHE[yahoo_ticker] = hit
+        else:
+            try:
+                info = yf.Ticker(yahoo_ticker).info
+                if not info:
+                    raise ValueError("réponse vide")
+                _PE_CACHE[yahoo_ticker] = (_to_float(info.get("trailingPE")),
+                                           _to_float(info.get("forwardPE")))
+                _PE_NEW[yahoo_ticker] = _PE_CACHE[yahoo_ticker]
+            except Exception:  # échec : retenu pour la session seulement, jamais sur disque
+                _PE_CACHE[yahoo_ticker] = (np.nan, np.nan)
     return _PE_CACHE[yahoo_ticker]
 
 
@@ -348,6 +380,9 @@ def add_pe(res: pd.DataFrame, progress_cb=None, workers: int = 8) -> pd.DataFram
             out[futs[f]] = f.result()
             if progress_cb:
                 progress_cb(i / len(tickers))
+    if CACHE and _PE_NEW:
+        CACHE.save_pe(dict(_PE_NEW))
+        _PE_NEW.clear()
     res = res.copy()
     res["PER"] = res["yahoo"].map(lambda y: out.get(y, (np.nan, np.nan))[0])
     res["PER prévu"] = res["yahoo"].map(lambda y: out.get(y, (np.nan, np.nan))[1])

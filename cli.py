@@ -8,14 +8,19 @@ Exemples :
     python drawdown_cli.py 25 6m --pe-max 15     # + filtre PER <= 15 (sur la short-list)
     python drawdown_cli.py                       # mode interactif (questions)
     python drawdown_cli.py --resolve             # vérifie/corrige la conversion XTB -> Yahoo
+    python drawdown_cli.py 30 6m --cache-ttl 72  # cours réutilisés jusqu'à 72 h sans requête
+    python drawdown_cli.py 30 6m --refresh       # ignore le cache et retélécharge tout
     python drawdown_cli.py --resolve --markets SE DK FI --suggest
 
+Par défaut la sortie est la seule liste des titres retenus (une ligne « ticker  nom », le plus
+touché d'abord) ; -v / --verbose rétablit la progression, le bilan du cache et le tableau détaillé.
 Les CFD sont toujours exclus.
 Durée : 90d (jours), 12w (semaines), 3m (mois), 1y (ans). "j" et "a" acceptés.
 """
 from __future__ import annotations
 
 import argparse
+import logging
 import re
 import sys
 from datetime import datetime
@@ -88,6 +93,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--csv", default=ds.DEFAULT_CSV, help="chemin du CSV XTB")
     p.add_argument("--map", help=f"table de correspondance XTB -> Yahoo "
                                  f"(défaut : {ds.MAP_FILE} à côté du CSV)")
+    p.add_argument("-v", "--verbose", action="store_true",
+                   help="affiche progression, bilan du cache et tableau détaillé "
+                        "(par défaut : seulement ticker et nom)")
+    p.add_argument("--no-cache", action="store_true", help="désactive le cache disque")
+    p.add_argument("--refresh", action="store_true",
+                   help="ignore le cache en lecture et retélécharge tout (le cache est réécrit)")
+    p.add_argument("--cache-dir", help=f"dossier du cache (défaut : {ds.CACHE_DIR} à côté du CSV)")
+    p.add_argument("--cache-ttl", type=float, default=12.0, metavar="HEURES",
+                   help="durée pendant laquelle les cours en cache sont réutilisés sans "
+                        "aucune requête (défaut 12 ; au-delà, seuls les derniers jours "
+                        "sont retéléchargés)")
     p.add_argument("--resolve", action="store_true",
                    help="vérifie les tickers Yahoo de l'univers filtré, corrige ceux qui "
                         "n'ont pas de cours (ex. NOVOB.DK -> NOVO-B.CO), enregistre la table, "
@@ -141,6 +157,21 @@ def run_resolve(uni: pd.DataFrame, map_path: str, suggest: bool) -> int:
 
 def main() -> int:
     args = build_parser().parse_args()
+    if not args.no_cache and not args.resolve:
+        root = args.cache_dir or Path(args.csv).resolve().parent / ds.CACHE_DIR
+        ds.configure_cache(root, ttl_hours=args.cache_ttl, refresh=args.refresh)
+    yf_log = logging.getLogger("yfinance")
+    previous_level = yf_log.level
+    if not args.verbose:
+        yf_log.setLevel(logging.CRITICAL)  # plus de « possibly delisted » ni d'erreurs curl
+    try:
+        return _main(args)
+    finally:
+        yf_log.setLevel(previous_level)
+        ds.configure_cache(None)  # pas d'état global qui traîne entre deux appels
+
+
+def _main(args) -> int:
     if args.drawdown is None and not args.resolve:
         args.drawdown = float(input("Drawdown minimum (%) : ").replace(",", "."))
     if args.duree is None and not args.resolve:
@@ -171,8 +202,10 @@ def main() -> int:
     end = pd.Timestamp.today().normalize()
     window_start = end - offset
     col = "DD actuel %" if args.mode == "actuel" else "DD max %"
-    print(f"{len(uni)} titres, fenêtre depuis {window_start.date()}, "
-          f"drawdown {args.mode} <= -{dd_threshold:g} %. Téléchargement…", file=sys.stderr)
+    verbose = args.verbose
+    if verbose:
+        print(f"{len(uni)} titres, fenêtre depuis {window_start.date()}, "
+              f"drawdown {args.mode} <= -{dd_threshold:g} %. Téléchargement…", file=sys.stderr)
 
     def progress(p):
         print(f"\r  {p:4.0%}", end="", file=sys.stderr, flush=True)
@@ -181,19 +214,29 @@ def main() -> int:
         print(f"\r  PER {p:4.0%}", end="", file=sys.stderr, flush=True)
 
     res, _, missing, analysed = ds.run_scan(
-        uni, window_start, end, dd_threshold, col, args.above_ma200, progress,
+        uni, window_start, end, dd_threshold, col, args.above_ma200,
+        progress if verbose else None,
         pe_max=args.pe_max, pe_min=args.pe_min,
         pe_col="PER" if args.pe_type == "trailing" else "PER prévu",
-        keep_missing_pe=args.keep_no_pe, show_pe=args.show_pe, pe_progress_cb=pe_progress)
-    print(file=sys.stderr)
-    print(f"{len(res)} titres retenus sur {analysed} analysés ({len(missing)} sans données)\n")
+        keep_missing_pe=args.keep_no_pe, show_pe=args.show_pe,
+        pe_progress_cb=pe_progress if verbose else None)
+    if verbose:
+        print(file=sys.stderr)
+        if ds.CACHE and ds.CACHE.stats:
+            st = ds.CACHE.stats
+            print(f"Cache : {st['fresh']} à jour, {st['updated']} complétés, "
+                  f"{st['full'] + st['redo']} téléchargés en entier, {st['dead']} ignorés "
+                  f"(sans cours récemment), {st['missing']} sans réponse.", file=sys.stderr)
+        print(f"{len(res)} titres retenus sur {analysed} analysés "
+              f"({len(missing)} sans données)\n")
+    total = analysed + len(missing)
     if missing:
-        if analysed + len(missing) >= 40 and len(missing) > 0.25 * (analysed + len(missing)):
-            print(f"ATTENTION : {len(missing)} titres sur {analysed + len(missing)} sans données. "
-                  "Si le journal montre des erreurs DNS/curl, ce sont des échecs réseau et non "
-                  "des titres disparus : résultats incomplets, relance avant d'en tirer des conclusions.",
+        if total >= 40 and len(missing) > 0.25 * total:
+            # seul message conservé hors mode verbose : la liste serait trompeuse
+            print(f"ATTENTION : {len(missing)} titres sur {total} sans données, probablement un "
+                  "problème réseau : liste incomplète, relance (-v pour le détail).",
                   file=sys.stderr)
-        else:
+        elif verbose:
             print("Astuce : `--resolve` peut corriger la conversion XTB -> Yahoo "
                   "des titres sans données.", file=sys.stderr)
     if res.empty:
@@ -207,17 +250,24 @@ def main() -> int:
     num = table.select_dtypes("number").columns
     table[num] = table[num].round(2)
     table["Nom"] = table["Nom"].str.slice(0, 32)
-    with pd.option_context("display.width", 200, "display.max_rows", None):
-        print(table.to_string(index=False))
+    if verbose:
+        with pd.option_context("display.width", 200, "display.max_rows", None):
+            print(table.to_string(index=False))
+    else:
+        width = res["ticker"].str.len().max()
+        print("\n".join(f"{t:<{width}}  {d}" for t, d in zip(res["ticker"], res["desc"])))
     if args.out:
         table.to_csv(args.out, index=False)
-        print(f"\nExporté : {args.out}")
+        if verbose:
+            print(f"\nExporté : {args.out}")
     return 0
 
 
 if __name__ == "__main__":
     try:
-        print(f"Projet exporté : {dump_for_llm()}", file=sys.stderr)
+        target = dump_for_llm()
+        if any(a in ("-v", "--verbose") for a in sys.argv[1:]):
+            print(f"Projet exporté : {target}", file=sys.stderr)
     except Exception as exc:  # l'export ne doit jamais bloquer le scan
         print(f"Export forllm.txt impossible : {exc}", file=sys.stderr)
     sys.exit(main())
