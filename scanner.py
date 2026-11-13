@@ -401,6 +401,121 @@ def filter_pe(res: pd.DataFrame, pe_min: float, pe_max: float,
 
 
 # --------------------------------------------------------------------------- #
+# ROIC (rentabilité du capital investi)
+# --------------------------------------------------------------------------- #
+_ROIC_CACHE: dict[str, tuple[float, float]] = {}
+_ROIC_NEW: dict[str, tuple[float, float]] = {}  # reçus du réseau, à écrire sur disque
+ROIC_DEFAULT_TAX = 0.25   # taux d'impôt de repli quand Yahoo n'en fournit pas
+ROIC_MAX_YEARS = 5
+
+
+def _first_row(df: pd.DataFrame, names: tuple[str, ...]) -> pd.Series | None:
+    """Première ligne trouvée parmi `names` (les libellés varient selon les versions de yfinance)."""
+    if df is None or df.empty:
+        return None
+    for n in names:
+        if n in df.index:
+            return pd.to_numeric(df.loc[n], errors="coerce")
+    return None
+
+
+def compute_roic(income: pd.DataFrame, balance: pd.DataFrame) -> tuple[float, float]:
+    """(ROIC du dernier exercice, ROIC moyen) en %, ou (NaN, NaN) si les comptes sont inexploitables.
+
+    ROIC = résultat opérationnel x (1 - taux d'impôt) / capital investi, par exercice annuel.
+    Capital investi : ligne « Invested Capital » de Yahoo, sinon dette + capitaux propres - trésorerie.
+    Les exercices où le capital investi est <= 0 sont ignorés (ratio non significatif).
+    La moyenne porte sur les ROIC_MAX_YEARS derniers exercices disponibles."""
+    ebit = _first_row(income, ("Operating Income", "EBIT"))
+    if ebit is None:
+        return np.nan, np.nan
+    tax = _first_row(income, ("Tax Rate For Calcs",))
+    invested = _first_row(balance, ("Invested Capital",))
+    if invested is None:
+        debt = _first_row(balance, ("Total Debt",))
+        equity = _first_row(balance, ("Stockholders Equity", "Total Equity Gross Minority Interest"))
+        cash = _first_row(balance, ("Cash And Cash Equivalents",
+                                    "Cash Cash Equivalents And Short Term Investments"))
+        if debt is None or equity is None:
+            return np.nan, np.nan
+        invested = debt + equity
+        if cash is not None:
+            invested = invested.sub(cash.reindex(invested.index).fillna(0.0))
+    ebit = ebit.copy()
+    ebit.index = pd.to_datetime(ebit.index, errors="coerce")
+    invested = invested.copy()
+    invested.index = pd.to_datetime(invested.index, errors="coerce")
+    ebit = ebit[ebit.index.notna()]
+    invested = invested[invested.index.notna()]
+    if tax is not None:
+        tax = tax.copy()
+        tax.index = pd.to_datetime(tax.index, errors="coerce")
+        tax = tax.reindex(ebit.index)
+        tax = tax.where((tax >= 0) & (tax <= 0.5)).fillna(ROIC_DEFAULT_TAX)
+    else:
+        tax = pd.Series(ROIC_DEFAULT_TAX, index=ebit.index)
+    inv = invested.reindex(ebit.index)
+    roic = (ebit * (1 - tax) / inv.where(inv > 0) * 100).replace([np.inf, -np.inf], np.nan).dropna()
+    if roic.empty:
+        return np.nan, np.nan
+    roic = roic.sort_index().tail(ROIC_MAX_YEARS)
+    return float(roic.iloc[-1]), float(roic.mean())
+
+
+def get_roic(yahoo_ticker: str) -> tuple[float, float]:
+    """(ROIC dernier exercice %, ROIC moyen %). NaN si Yahoo n'a pas les comptes
+    (ETF, titre mal couvert, capital investi négatif...)."""
+    if yahoo_ticker not in _ROIC_CACHE:
+        hit = CACHE.get_roic(yahoo_ticker) if CACHE else None
+        if hit is not None:
+            _ROIC_CACHE[yahoo_ticker] = hit
+        else:
+            try:
+                tk = yf.Ticker(yahoo_ticker)
+                income, balance = tk.income_stmt, tk.balance_sheet
+                if income is None or income.empty or balance is None or balance.empty:
+                    raise ValueError("comptes vides")
+                _ROIC_CACHE[yahoo_ticker] = compute_roic(income, balance)
+                _ROIC_NEW[yahoo_ticker] = _ROIC_CACHE[yahoo_ticker]
+            except Exception:  # échec : retenu pour la session seulement, jamais sur disque
+                _ROIC_CACHE[yahoo_ticker] = (np.nan, np.nan)
+    return _ROIC_CACHE[yahoo_ticker]
+
+
+def add_roic(res: pd.DataFrame, progress_cb=None, workers: int = 4) -> pd.DataFrame:
+    """Ajoute les colonnes « ROIC % » (dernier exercice) et « ROIC moy % » (une requête double
+    par titre, en parallèle). Appelé uniquement sur la short-list, après les autres filtres.
+    Le ROIC n'a de sens que pour les actions : les ETF ne sont pas interrogés (NaN)."""
+    tickers = res.loc[res["section"] == "Stock", "yahoo"].drop_duplicates().tolist()
+    out = {}
+    if tickers:
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futs = {ex.submit(get_roic, y): y for y in tickers}
+            for i, f in enumerate(as_completed(futs), 1):
+                out[futs[f]] = f.result()
+                if progress_cb:
+                    progress_cb(i / len(tickers))
+    if CACHE and _ROIC_NEW:
+        CACHE.save_roic(dict(_ROIC_NEW))
+        _ROIC_NEW.clear()
+    res = res.copy()
+    res["ROIC %"] = res["yahoo"].map(lambda y: out.get(y, (np.nan, np.nan))[0])
+    res["ROIC moy %"] = res["yahoo"].map(lambda y: out.get(y, (np.nan, np.nan))[1])
+    return res
+
+
+def filter_roic(res: pd.DataFrame, roic_min: float, roic_col: str,
+                keep_missing: bool) -> pd.DataFrame:
+    """Filtre sur le ROIC minimum. S'applique aux actions uniquement : les ETF passent toujours."""
+    roic = res[roic_col]
+    ok = roic >= roic_min  # NaN -> False
+    if keep_missing:
+        ok = ok | roic.isna()
+    ok = ok | (res["section"] != "Stock")
+    return res[ok]
+
+
+# --------------------------------------------------------------------------- #
 # Calculs
 # --------------------------------------------------------------------------- #
 def compute_metrics(close: pd.Series, window_start: pd.Timestamp,
@@ -430,7 +545,10 @@ def run_scan(universe: pd.DataFrame, window_start: pd.Timestamp, end: pd.Timesta
              dd_threshold: float, dd_column: str, above_ma200: bool,
              progress_cb=None, pe_max: float | None = None, pe_min: float = 0.0,
              pe_col: str = "PER", keep_missing_pe: bool = False,
-             show_pe: bool = False, pe_progress_cb=None):
+             show_pe: bool = False, pe_progress_cb=None,
+             roic_min: float | None = None, roic_col: str = "ROIC moy %",
+             keep_missing_roic: bool = False, show_roic: bool = False,
+             roic_progress_cb=None):
     """Retourne (résultats filtrés, prix, liste des tickers sans données, nb analysés)."""
     # On charge au moins ~14 mois pour pouvoir calculer la MM200
     fetch_start = min(window_start, end - pd.Timedelta(days=420))
@@ -472,6 +590,12 @@ def run_scan(universe: pd.DataFrame, window_start: pd.Timestamp, end: pd.Timesta
         if pe_max is not None:
             res = filter_pe(res, pe_min, pe_max, pe_col, keep_missing_pe)
             res = res.reset_index(drop=True)
+    # ROIC : après le PER, donc seulement pour les titres qui ont survécu aux autres filtres
+    if not res.empty and (roic_min is not None or show_roic):
+        res = add_roic(res, roic_progress_cb)
+        if roic_min is not None:
+            res = filter_roic(res, roic_min, roic_col, keep_missing_roic)
+            res = res.reset_index(drop=True)
     return res, prices, missing_xtb, analysed
 
 
@@ -506,6 +630,14 @@ def main():
                 "Type de PER", ["Actuel (12 derniers mois)", "Prévu (forward)"]
             ).startswith("Actuel") else "PER prévu"
             keep_missing = st.checkbox("Garder les titres sans PER disponible", False)
+        use_roic = st.checkbox("Filtrer sur le ROIC (actions uniquement, les ETF ne sont pas filtrés)", False)
+        roic_min, roic_col, keep_missing_roic = None, "ROIC moy %", False
+        if use_roic:
+            roic_min = st.slider("ROIC minimum (%)", 0, 40, 10)
+            roic_col = "ROIC moy %" if st.radio(
+                "Type de ROIC", ["Moyenne des derniers exercices", "Dernier exercice"]
+            ).startswith("Moyenne") else "ROIC %"
+            keep_missing_roic = st.checkbox("Garder les titres sans ROIC disponible", False)
         limit = st.number_input("Limiter à N titres (0 = tous, utile pour tester)",
                                 min_value=0, value=0, step=50)
 
@@ -547,6 +679,8 @@ def main():
             progress_cb=lambda p: bar.progress(p, text="Téléchargement des cours…"),
             pe_max=pe_max, pe_col=pe_col, keep_missing_pe=keep_missing,
             pe_progress_cb=lambda p: bar.progress(p, text="Récupération des PER…"),
+            roic_min=roic_min, roic_col=roic_col, keep_missing_roic=keep_missing_roic,
+            roic_progress_cb=lambda p: bar.progress(p, text="Récupération des ROIC…"),
         )
         bar.empty()
         st.session_state["scan"] = {
@@ -566,7 +700,7 @@ def main():
     if not res.empty:
         cols = ["ticker", "desc", "section", "currency", "market", scan["col"],
                 "DD actuel %", "DD max %", "Perf période %", "vs MM200 %"]
-        cols += [c for c in ("PER", "PER prévu") if c in res.columns]
+        cols += [c for c in ("PER", "PER prévu", "ROIC %", "ROIC moy %") if c in res.columns]
         cols += ["Plus haut période", "Date plus haut", "Date creux"]
         cols = list(dict.fromkeys(cols))  # dédoublonne en gardant l'ordre
         table = res[cols].rename(columns={
@@ -591,7 +725,8 @@ def main():
         "(le change n'est pas pris en compte). « PEA probable » se base sur la place de "
         "cotation et le mot PEA dans le nom des ETF : vérifie l'éligibilité sur la fiche "
         "du titre. Yahoo ne couvre pas tous les tickers XTB. Le PER vient de Yahoo : absent "
-        "si les bénéfices sont négatifs, et peu comparable d'un secteur à l'autre."
+        "si les bénéfices sont négatifs, et peu comparable d'un secteur à l'autre. Le ROIC est "
+        "calculé à partir des comptes annuels Yahoo (≈ 4 ans) : approximatif, à recouper."
     )
 
 

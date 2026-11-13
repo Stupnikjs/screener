@@ -1,10 +1,11 @@
 """
-Cache disque persistant pour le scanner : cours de clôture et PER.
+Cache disque persistant pour le scanner : cours de clôture, PER et ROIC.
 
 Disposition (dans le dossier racine, par défaut `.cache` à côté du CSV) :
     prices/px_<ticker>.csv   un fichier par titre : colonnes date, close (cours ajustés)
     prices_meta.json         par titre : date du dernier téléchargement, début couvert, statut
     pe.json                  PER (12 mois / prévu) avec date de téléchargement
+    roic.json                ROIC (dernier exercice / moyenne) avec date de téléchargement
 
 Principes :
 - un titre « à jour » (téléchargé depuis moins de `ttl_hours`) ne génère aucune requête ;
@@ -52,15 +53,18 @@ def _atomic_write(path: Path, text: str) -> None:
 class DiskCache:
     META = "prices_meta.json"
     PE = "pe.json"
+    ROIC = "roic.json"
 
     def __init__(self, root, ttl_hours: float = 12.0, dead_ttl_hours: float = 24.0,
                  pe_ttl_hours: float = 24.0, overlap_days: int = 7, refresh: bool = False,
                  batch: int = 200, tolerance: float = 1e-3, dead_max_share: float = 0.15,
+                 roic_ttl_hours: float = 168.0,
                  now: Callable[[], datetime] | None = None):
         self.root = Path(root)
         self.ttl = ttl_hours
         self.dead_ttl = dead_ttl_hours
         self.pe_ttl = pe_ttl_hours
+        self.roic_ttl = roic_ttl_hours      # les comptes changent au trimestre : 7 jours
         self.overlap = pd.Timedelta(days=overlap_days)
         self.refresh = refresh
         self.batch = batch
@@ -69,6 +73,7 @@ class DiskCache:
         self._now = now or datetime.now
         self.stats: dict[str, int] = {}
         self._pe: dict | None = None
+        self._roic: dict | None = None
 
     # ------------------------------------------------------------------ fichiers
     def _series_path(self, ticker: str) -> Path:
@@ -257,3 +262,39 @@ class DiskCache:
                        "forward": None if pd.isna(fw) else float(fw),
                        "fetched_at": stamp}
         _atomic_write(self.root / self.PE, json.dumps(data, indent=0, sort_keys=True))
+
+    # --------------------------------------------------------------------- ROIC
+    def _roic_data(self) -> dict:
+        if self._roic is None:
+            try:
+                data = json.loads((self.root / self.ROIC).read_text(encoding="utf-8"))
+                self._roic = data if isinstance(data, dict) else {}
+            except (OSError, ValueError):
+                self._roic = {}
+        return self._roic
+
+    def get_roic(self, ticker: str) -> tuple[float, float] | None:
+        """(ROIC dernier exercice, ROIC moyen) en cache et encore valable, sinon None."""
+        if self.refresh:
+            return None
+        e = self._roic_data().get(ticker)
+        try:
+            age = (self._now() - datetime.fromisoformat(e["fetched_at"])).total_seconds() / 3600
+            if age >= self.roic_ttl:
+                return None
+            return (np.nan if e["last"] is None else float(e["last"]),
+                    np.nan if e["avg"] is None else float(e["avg"]))
+        except (KeyError, ValueError, TypeError):
+            return None
+
+    def save_roic(self, items: dict) -> None:
+        """Enregistre {ticker: (ROIC, ROIC moyen)} ; NaN devient null."""
+        if not items:
+            return
+        data = self._roic_data()
+        stamp = self._now().isoformat(timespec="seconds")
+        for t, (last, avg) in items.items():
+            data[t] = {"last": None if pd.isna(last) else float(last),
+                       "avg": None if pd.isna(avg) else float(avg),
+                       "fetched_at": stamp}
+        _atomic_write(self.root / self.ROIC, json.dumps(data, indent=0, sort_keys=True))

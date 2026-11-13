@@ -6,6 +6,7 @@ Exemples :
     python drawdown_cli.py 20 3m                 # drawdown >= 20 % sur 3 mois
     python drawdown_cli.py 30 1y --mode max --pea --above-ma200
     python drawdown_cli.py 25 6m --pe-max 15     # + filtre PER <= 15 (sur la short-list)
+    python drawdown_cli.py 25 6m --roic-min 10   # + filtre ROIC moyen >= 10 % (sur la short-list)
     python drawdown_cli.py                       # mode interactif (questions)
     python drawdown_cli.py --resolve             # vérifie/corrige la conversion XTB -> Yahoo
     python drawdown_cli.py 30 6m --cache-ttl 72  # cours réutilisés jusqu'à 72 h sans requête
@@ -125,6 +126,13 @@ def build_parser() -> argparse.ArgumentParser:
                    help="PER sur 12 mois (trailing) ou prévu (forward)")
     p.add_argument("--keep-no-pe", action="store_true", help="garder les titres sans PER")
     p.add_argument("--show-pe", action="store_true", help="afficher le PER sans filtrer")
+    p.add_argument("--roic-min", type=float,
+                   help="ROIC minimum en %% (ex. 10), actions uniquement : les ETF ne sont pas filtrés. "
+                        "Calculé depuis les comptes annuels Yahoo, sur la short-list seulement")
+    p.add_argument("--roic-type", choices=["avg", "last"], default="avg",
+                   help="ROIC moyen des derniers exercices (avg, défaut) ou du dernier exercice (last)")
+    p.add_argument("--keep-no-roic", action="store_true", help="garder les titres sans ROIC")
+    p.add_argument("--show-roic", action="store_true", help="afficher le ROIC sans filtrer")
     p.add_argument("--limit", type=int, default=0, help="limiter à N titres (test rapide)")
     p.add_argument("--out", help="exporter le résultat en CSV")
     return p
@@ -213,13 +221,20 @@ def _main(args) -> int:
     def pe_progress(p):
         print(f"\r  PER {p:4.0%}", end="", file=sys.stderr, flush=True)
 
+    def roic_progress(p):
+        print(f"\r  ROIC {p:4.0%}", end="", file=sys.stderr, flush=True)
+
     res, _, missing, analysed = ds.run_scan(
         uni, window_start, end, dd_threshold, col, args.above_ma200,
         progress if verbose else None,
         pe_max=args.pe_max, pe_min=args.pe_min,
         pe_col="PER" if args.pe_type == "trailing" else "PER prévu",
         keep_missing_pe=args.keep_no_pe, show_pe=args.show_pe,
-        pe_progress_cb=pe_progress if verbose else None)
+        pe_progress_cb=pe_progress if verbose else None,
+        roic_min=args.roic_min,
+        roic_col="ROIC moy %" if args.roic_type == "avg" else "ROIC %",
+        keep_missing_roic=args.keep_no_roic, show_roic=args.show_roic,
+        roic_progress_cb=roic_progress if verbose else None)
     if verbose:
         print(file=sys.stderr)
         if ds.CACHE and ds.CACHE.stats:
@@ -244,7 +259,7 @@ def _main(args) -> int:
 
     cols = ["ticker", "desc", "currency", "DD actuel %", "DD max %", "Perf période %",
             "vs MM200 %"]
-    cols += [c for c in ("PER", "PER prévu") if c in res.columns]
+    cols += [c for c in ("PER", "PER prévu", "ROIC %", "ROIC moy %") if c in res.columns]
     cols += ["Dernier cours", "Date plus haut"]
     table = res[cols].rename(columns={"ticker": "Ticker", "desc": "Nom", "currency": "Devise"})
     num = table.select_dtypes("number").columns
